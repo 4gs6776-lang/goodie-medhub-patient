@@ -13,6 +13,8 @@ import Results from './pages/Results'
 import Bills from './pages/Bills'
 import Appointments from './pages/Appointments'
 import Documents from './pages/Documents'
+import Prescriptions from './pages/Prescriptions'
+import Notifications from './pages/Notifications'
 import './index.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
@@ -20,26 +22,19 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     <BrowserRouter>
       <AuthProvider>
         <Routes>
-          {/* Public routes */}
           <Route path="/login" element={<Login />} />
           <Route path="/verify-phone" element={<VerifyPhone />} />
           <Route path="/no-record" element={<NoRecord />} />
-
-          {/* Protected routes */}
-          <Route element={
-            <ProtectedRoute>
-              <Layout />
-            </ProtectedRoute>
-          }>
+          <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/results" element={<Results />} />
             <Route path="/bills" element={<Bills />} />
             <Route path="/appointments" element={<Appointments />} />
             <Route path="/documents" element={<Documents />} />
+            <Route path="/prescriptions" element={<Prescriptions />} />
+            <Route path="/notifications" element={<Notifications />} />
             <Route path="/profile" element={<Profile />} />
           </Route>
-
-          {/* Fallback */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AuthProvider>
