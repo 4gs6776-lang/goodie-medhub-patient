@@ -78,11 +78,14 @@ export function AuthProvider({ children }) {
       if (!patientData && pendingLookupRef.current) {
         const { name, hospitalId: hid, mrn } = pendingLookupRef.current
         if (name && hid && mrn) {
+          // The patients table only has `hospital_number` as its MRN column
+          // (added in migration 068). There is no `mrn` column on patients —
+          // do not include `mrn.eq.` in the OR filter or PostgREST will error.
           const { data: p, error: pErr } = await supabase
             .from('patients')
             .select('*')
             .eq('hospital_id', hid)
-            .or(`hospital_number.eq.${mrn},mrn.eq.${mrn},patient_id.eq.${mrn}`)
+            .or(`hospital_number.eq.${mrn},patient_id.eq.${mrn}`)
             .ilike('full_name', name)
             .maybeSingle()
 
@@ -98,7 +101,7 @@ export function AuthProvider({ children }) {
                 patient_id: p.id,
                 hospital_id: p.hospital_id,
                 patient_name: p.full_name,
-                mrn: p.hospital_number || p.mrn,
+                mrn: p.hospital_number || p.id,
                 is_relative: false,
                 is_active: true,
               }, { onConflict: 'user_id,patient_id' })
@@ -254,11 +257,14 @@ export function AuthProvider({ children }) {
     }
 
     // Step 1: look up the patient record by (hospital_id + mrn)
+    // The patients table only has `hospital_number` as its MRN column
+    // (added in migration 068). There is no `mrn` column on patients —
+    // do not include it in the select list or PostgREST will error.
     const { data: patientData, error: lookupError } = await supabase
       .from('patients')
-      .select('id, hospital_id, full_name, email, phone, hospital_number, mrn')
+      .select('id, hospital_id, full_name, email, phone, hospital_number')
       .eq('hospital_id', hospitalId)
-      .or(`hospital_number.eq.${mrn.trim()},mrn.eq.${mrn.trim()},patient_id.eq.${mrn.trim()}`)
+      .or(`hospital_number.eq.${mrn.trim()},patient_id.eq.${mrn.trim()}`)
       .maybeSingle()
 
     if (lookupError || !patientData) {
@@ -321,7 +327,7 @@ export function AuthProvider({ children }) {
         patient_id: patientData.id,
         hospital_id: patientData.hospital_id,
         patient_name: patientData.full_name,
-        mrn: patientData.hospital_number || patientData.mrn || mrn.trim(),
+        mrn: patientData.hospital_number || mrn.trim(),
         is_relative: false,
         is_active: true,
       })
@@ -344,7 +350,7 @@ export function AuthProvider({ children }) {
     pendingLookupRef.current = {
       name: patientData.full_name,
       hospitalId: patientData.hospital_id,
-      mrn: patientData.hospital_number || patientData.mrn || mrn.trim(),
+      mrn: patientData.hospital_number || mrn.trim(),
     }
 
     return { data: authData, error: null }
