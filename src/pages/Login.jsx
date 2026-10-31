@@ -1,45 +1,102 @@
-import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { Stethoscope, Mail, Lock, Eye, EyeOff, ArrowRight, UserPlus, LogIn } from 'lucide-react'
+import { supabase } from '../lib/supabaseClient'
+import { Stethoscope, Mail, Lock, Eye, EyeOff, UserPlus, LogIn, Hospital, Loader2, User } from 'lucide-react'
 
 export default function Login() {
   const { login, signup } = useAuth()
   const navigate = useNavigate()
   const [mode, setMode] = useState('login') // 'login' | 'signup'
-  const [email, setEmail] = useState('')
+
+  // Login-mode fields (no email — resolved via lookup_portal_email RPC)
+  const [name, setName] = useState('')
+  const [hospitalId, setHospitalId] = useState('')
+  const [mrn, setMrn] = useState('')
   const [password, setPassword] = useState('')
+
+  // Signup-mode extra field (auth still needs an email)
+  const [email, setEmail] = useState('')
+
+  // Hospitals list for the dropdown
+  const [hospitals, setHospitals] = useState([])
+
   const [showPassword, setShowPassword] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+
+  // Load the hospitals list once on mount — needed for the hospital dropdown
+  useEffect(() => {
+    let mounted = true
+    supabase
+      .from('hospitals')
+      .select('id, name')
+      .order('name', { ascending: true })
+      .then(({ data }) => {
+        if (mounted && data) setHospitals(data)
+      })
+    return () => { mounted = false }
+  }, [])
 
   async function handleSubmit(e) {
     e.preventDefault()
     setError('')
-    if (!email.trim() || !password) {
-      setError('Please enter your email and password.')
+    setSuccess('')
+
+    if (!password || password.length < 6) {
+      setError('Password must be at least 6 characters.')
       return
     }
+
+    if (!name.trim() || !hospitalId || !mrn.trim()) {
+      setError('Please fill in your name, hospital, and hospital number.')
+      return
+    }
+
     setLoading(true)
     try {
       if (mode === 'login') {
-        const { error } = await login(email.trim(), password)
-        if (error) {
-          setError(error.message || 'Login failed. Check your email and password.')
+        // LOGIN — patient types name + hospital + MRN + password.
+        // The AuthContext.login() resolves the auth email via the
+        // lookup_portal_email RPC, then signs in.
+        const { error: loginError } = await login({
+          name: name.trim(),
+          hospitalId,
+          mrn: mrn.trim(),
+          password,
+        })
+        if (loginError) {
+          setError(loginError.message || 'Login failed. Check your details and try again.')
         } else {
           navigate('/')
         }
       } else {
-        const { data, error } = await signup(email.trim(), password)
-        if (error) {
-          setError(error.message || 'Sign up failed.')
-        } else if (data?.user) {
+        // SIGNUP — patient self-registers using name + hospital + MRN + email + password
+        if (!email.trim()) {
+          setError('Please enter your email address.')
+          setLoading(false)
+          return
+        }
+        const { error: signupError } = await signup({
+          name: name.trim(),
+          hospitalId,
+          mrn: mrn.trim(),
+          email: email.trim(),
+          password,
+        })
+        if (signupError) {
+          setError(signupError.message || 'Could not create account.')
+        } else {
           // Check if email confirmation is required
-          if (!data.session) {
-            setError('Please check your email to confirm your account, then log in.')
-            setMode('login')
-          } else {
+          const { data: session } = await supabase.auth.getSession()
+          if (session?.session) {
             navigate('/')
+          } else {
+            setSuccess('Account created! Please check your email to confirm your account, then log in.')
+            setMode('login')
+            setEmail('')
+            setPassword('')
           }
         }
       }
@@ -48,6 +105,12 @@ export default function Login() {
     } finally {
       setLoading(false)
     }
+  }
+
+  function switchMode(next) {
+    setMode(next)
+    setError('')
+    setSuccess('')
   }
 
   return (
@@ -67,7 +130,9 @@ export default function Login() {
           {mode === 'login' ? 'Welcome Back' : 'Create Account'}
         </h2>
         <p className="text-sm text-surface-500 mb-5">
-          {mode === 'login' ? 'Sign in to access your health records' : 'Sign up to access your patient portal'}
+          {mode === 'login'
+            ? 'Sign in with your hospital number'
+            : 'Sign up using your hospital number'}
         </p>
 
         {error && (
@@ -76,22 +141,92 @@ export default function Login() {
           </div>
         )}
 
+        {success && (
+          <div className="mb-4 p-3 rounded-lg bg-accent-50 border border-accent-100 text-sm text-accent-700">
+            {success}
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Full Name — required in both modes */}
           <div>
-            <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Email Address</label>
+            <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Full Name</label>
             <div className="relative">
-              <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
+              <User size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
               <input
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                placeholder="you@example.com"
+                type="text"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Exactly as registered at the hospital"
                 className="w-full pl-10 pr-4 py-3 text-sm rounded-xl border border-surface-200 bg-surface-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all-smooth"
-                autoComplete="email"
+                required
+                autoFocus
+              />
+            </div>
+            <p className="text-[11px] text-surface-400 mt-1.5">
+              Must match the name on your hospital record.
+            </p>
+          </div>
+
+          {/* Hospital dropdown — required in both modes */}
+          <div>
+            <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Hospital</label>
+            <div className="relative">
+              <Hospital size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
+              <select
+                value={hospitalId}
+                onChange={e => setHospitalId(e.target.value)}
+                className="w-full pl-10 pr-4 py-3 text-sm rounded-xl border border-surface-200 bg-surface-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all-smooth appearance-none"
+                required
+              >
+                <option value="">Select your hospital</option>
+                {hospitals.map(h => (
+                  <option key={h.id} value={h.id}>{h.name}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Hospital Number (MRN) — required in both modes */}
+          <div>
+            <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Hospital Number (MRN)</label>
+            <div className="relative">
+              <Hospital size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
+              <input
+                type="text"
+                value={mrn}
+                onChange={e => setMrn(e.target.value)}
+                placeholder="e.g. GMH/2026/0001"
+                className="w-full pl-10 pr-4 py-3 text-sm rounded-xl border border-surface-200 bg-surface-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all-smooth"
                 required
               />
             </div>
+            <p className="text-[11px] text-surface-400 mt-1.5">
+              This is the number on your hospital registration card or folder.
+            </p>
           </div>
+
+          {/* Email — only required for signup (login resolves it via RPC) */}
+          {mode === 'signup' && (
+            <div>
+              <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Email Address</label>
+              <div className="relative">
+                <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
+                <input
+                  type="email"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  className="w-full pl-10 pr-4 py-3 text-sm rounded-xl border border-surface-200 bg-surface-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all-smooth"
+                  autoComplete="email"
+                  required
+                />
+              </div>
+              <p className="text-[11px] text-surface-400 mt-1.5">
+                Used to create your login account. You won't need to type it again.
+              </p>
+            </div>
+          )}
 
           <div>
             <label className="text-xs font-semibold text-surface-600 mb-1.5 block">Password</label>
@@ -114,6 +249,9 @@ export default function Login() {
                 {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
+            {mode === 'signup' && (
+              <p className="text-[11px] text-surface-400 mt-1.5">Minimum 6 characters</p>
+            )}
           </div>
 
           <button
@@ -122,7 +260,7 @@ export default function Login() {
             className="w-full py-3 rounded-xl bg-primary-500 hover:bg-primary-600 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all-smooth disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? (
-              <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              <Loader2 size={18} className="animate-spin" />
             ) : mode === 'login' ? (
               <>
                 <LogIn size={18} /> Sign In
@@ -138,12 +276,22 @@ export default function Login() {
         {/* Toggle mode */}
         <div className="mt-5 text-center">
           <button
-            onClick={() => { setMode(m => m === 'login' ? 'signup' : 'login'); setError('') }}
+            onClick={() => switchMode(mode === 'login' ? 'signup' : 'login')}
             className="text-sm text-primary-500 hover:text-primary-600 font-medium"
           >
-            {mode === 'login' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
+            {mode === 'login'
+              ? "Don't have an account? Sign up"
+              : 'Already have an account? Sign in'}
           </button>
         </div>
+
+        {mode === 'signup' && (
+          <div className="mt-3 p-3 rounded-lg bg-primary-50 text-center">
+            <p className="text-[11px] text-primary-600">
+              Ask your hospital staff to register you first, then use your hospital number to create your portal account.
+            </p>
+          </div>
+        )}
       </div>
 
       <p className="text-xs text-surface-400 mt-6 text-center max-w-xs">
