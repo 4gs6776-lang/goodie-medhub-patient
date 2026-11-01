@@ -26,15 +26,21 @@ export default function Login() {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
 
-  // Load the hospitals list once on mount — needed for the hospital dropdown
+  // Load the hospitals list once on mount — needed for the hospital dropdown.
+  // We use the `list_portal_hospitals()` SECURITY DEFINER RPC instead of
+  // querying the `hospitals` table directly because the table is locked
+  // down by RLS policies that require an authenticated user. On the Login
+  // page, the patient is NOT yet authenticated, so a direct table query
+  // returns 0 rows and the dropdown renders empty. The RPC runs with the
+  // function owner's privileges and bypasses RLS, exposing only the columns
+  // needed for the public dropdown (id, name, logo_url).
   useEffect(() => {
     let mounted = true
     supabase
-      .from('hospitals')
-      .select('id, name')
-      .order('name', { ascending: true })
-      .then(({ data }) => {
+      .rpc('list_portal_hospitals')
+      .then(({ data, error }) => {
         if (mounted && data) setHospitals(data)
+        if (error) console.warn('list_portal_hospitals RPC error:', error.message)
       })
     return () => { mounted = false }
   }, [])
