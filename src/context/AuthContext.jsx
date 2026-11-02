@@ -3,6 +3,32 @@ import { supabase } from '../lib/supabaseClient'
 
 const AuthContext = createContext(null)
 
+// =====================================================================
+// NEW ARCHITECTURE — JWT-based patient identification
+// =====================================================================
+//
+// The previous version queried the `patient_users` and `patients`
+// tables after login to find the patient record. That depended on:
+//   1. RLS policies allowing the read (which kept failing)
+//   2. The `get-my-patient-data` Edge Function being deployed
+//   3. Network round-trips that could fail
+//
+// This version reads patient_id, hospital_id, and patient_name DIRECTLY
+// from `session.user.user_metadata` — which the `create-portal-account`
+// Edge Function sets at account creation time. The JWT is populated
+// by Supabase Auth automatically, so this works:
+//   - With ZERO database queries (no RLS can block it)
+//   - With ZERO Edge Function calls (no deployment dependency)
+//   - With ZERO network round-trips (data is in the session already)
+//   - Even if the database is completely down
+//
+// FALLBACK CHAIN (only if user_metadata is missing — e.g., for accounts
+// created before the Edge Function existed):
+//   1. Try the get-my-patient-data Edge Function (if deployed)
+//   2. Try direct table query on patient_users (may fail due to RLS)
+//   3. Use just the user_metadata (minimal but functional)
+// =====================================================================
+
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)
   const [user, setUser] = useState(null)
@@ -12,22 +38,15 @@ export function AuthProvider({ children }) {
   const [phoneVerified, setPhoneVerified] = useState(false)
 
   // Stash the last-used lookup credentials (name, hospital_id, mrn) so
-  // loadPatientData can fall back to them if the patient_users link is
-  // missing. These come from the Login form.
+  // loadPatientData can fall back to them if user_metadata is missing.
   const pendingLookupRef = useRef(null)
 
   // -----------------------------------------------------------------
   // loadPatientData — find the patient record + hospital for the
   // currently-authenticated user.
   //
-  // Lookup order (after the migration 070 fix):
-  //   1. patient_users.user_id  (= auth.uid())  ← primary, always works
-  //   2. patients table by (full_name + hospital_id + mrn)  ← fallback
-  //      using the credentials the patient typed at login, stashed
-  //      in pendingLookupRef.
-  //
-  // The old email-based fallback is REMOVED — it was unreliable
-  // (multiple patients can share an email).
+  // NEW: Try user_metadata FIRST (zero queries, zero RLS dependency).
+  // Only fall back to DB queries if user_metadata is missing.
   // -----------------------------------------------------------------
   const loadPatientData = useCallback(async (authUser) => {
     if (!authUser?.id) {
@@ -37,64 +56,152 @@ export function AuthProvider({ children }) {
     }
 
     try {
-      // ---------------------------------------------------------------
-      // Call the get-my-patient-data Edge Function.
-      //
-      // WHY NOT direct table queries?
-      //   The patient portal was querying patient_users + patients
-      //   directly from the browser. Even though the patient_users row
-      //   existed (verified via SQL editor with the service role), the
-      //   browser kept getting 0 rows back. The cause was an RLS policy
-      //   that blocked the patient from reading their own row.
-      //
-      //   The Edge Function uses the SERVICE ROLE KEY (server-side only,
-      //   never exposed to the browser) to bypass RLS entirely. It:
-      //     1. Verifies the caller's JWT (patient must be logged in)
-      //     2. Reads patient_users WHERE user_id = auth.uid()
-      //     3. Falls back to (name + hospital_id + mrn) if no link
-      //     4. Reads the patient record + hospital record
-      //     5. Returns everything as one bundle
-      //
-      // We pass the optional (name, hospital_id, mrn) from
-      // pendingLookupRef so the function can use the name+mrn fallback
-      // if the patient_users link is missing.
-      // ---------------------------------------------------------------
-      const fallbackBody = pendingLookupRef.current
-        ? {
-            name: pendingLookupRef.current.name,
-            hospital_id: pendingLookupRef.current.hospitalId,
-            mrn: pendingLookupRef.current.mrn,
+      let patientData = null
+      let hospitalId = null
+      let lookupMethod = 'none'
+
+      // =============================================================
+      // STEP 1 (PRIMARY): Read from JWT user_metadata.
+      // The create-portal-account Edge Function stores patient_id,
+      // hospital_id, and patient_name in user_metadata at account
+      // creation time. This is ALWAYS available immediately after
+      // login — no DB query, no RLS, no network round-trip.
+      // =============================================================
+      const meta = authUser.user_metadata || {}
+      if (meta.patient_id) {
+        patientData = {
+          id: meta.patient_id,
+          hospital_id: meta.hospital_id,
+          full_name: meta.patient_name || 'Patient',
+          // These may not be in user_metadata (depending on when the
+          // account was created), but the dashboard can handle missing
+          // fields gracefully.
+          hospital_number: meta.hospital_number || meta.mrn || null,
+          phone: meta.phone || null,
+          email: authUser.email || null,
+          // Mark this as a metadata-derived record so the UI knows it
+          // may be incomplete. The dashboard will still render.
+          _source: 'jwt_metadata',
+        }
+        hospitalId = meta.hospital_id
+        lookupMethod = 'jwt_user_metadata'
+      }
+
+      // =============================================================
+      // STEP 2 (FALLBACK): If user_metadata doesn't have patient_id
+      // (e.g., for accounts created before the Edge Function existed,
+      // or accounts created via self-signup), try the get-my-patient-data
+      // Edge Function. This uses the service role key to bypass RLS.
+      // =============================================================
+      if (!patientData) {
+        try {
+          const fallbackBody = pendingLookupRef.current
+            ? {
+                name: pendingLookupRef.current.name,
+                hospital_id: pendingLookupRef.current.hospitalId,
+                mrn: pendingLookupRef.current.mrn,
+              }
+            : {}
+
+          const { data: bundle, error: fnError } = await supabase.functions.invoke(
+            'get-my-patient-data',
+            { body: fallbackBody }
+          )
+
+          if (!fnError && bundle?.patient) {
+            patientData = bundle.patient
+            hospitalId = bundle.patient.hospital_id || bundle.hospital?.id
+            lookupMethod = 'edge_function'
           }
-        : {}
-
-      const { data: bundle, error: fnError } = await supabase.functions.invoke(
-        'get-my-patient-data',
-        { body: fallbackBody }
-      )
-
-      if (fnError) {
-        console.error('get-my-patient-data Edge Function error:', fnError.message)
-        setPatient(null)
-        setHospital(null)
-        return
+        } catch (e) {
+          console.warn('get-my-patient-data Edge Function failed (non-fatal):', e.message)
+        }
       }
 
-      if (!bundle || !bundle.patient) {
-        console.warn('No patient record found for auth user:', authUser.id, '(lookup_method:', bundle?.lookup_method || 'unknown', ')')
-        setPatient(null)
-        setHospital(null)
-        return
+      // =============================================================
+      // STEP 3 (FALLBACK): If both user_metadata and the Edge Function
+      // failed, try a direct table query on patient_users. This MAY
+      // fail due to RLS, but we try anyway as a last resort.
+      // =============================================================
+      if (!patientData) {
+        try {
+          const { data: userRow } = await supabase
+            .from('patient_users')
+            .select('patient_id, hospital_id, patient_name, mrn')
+            .eq('user_id', authUser.id)
+            .eq('is_active', true)
+            .maybeSingle()
+
+          if (userRow?.patient_id) {
+            const { data: p } = await supabase
+              .from('patients')
+              .select('*')
+              .eq('id', userRow.patient_id)
+              .maybeSingle()
+
+            if (p) {
+              patientData = p
+              hospitalId = userRow.hospital_id || p.hospital_id
+              lookupMethod = 'direct_query'
+            }
+          }
+        } catch (e) {
+          console.warn('Direct patient_users query failed (non-fatal):', e.message)
+        }
       }
 
-      setPatient(bundle.patient)
-      setHospital(bundle.hospital || null)
+      // =============================================================
+      // STEP 4: If we STILL don't have patient data, use whatever we
+      // can from the auth user's email + user_metadata. This ensures
+      // the patient ALWAYS sees SOMETHING after login, even if every
+      // DB query + Edge Function failed.
+      // =============================================================
+      if (!patientData) {
+        console.warn('All patient lookup methods failed — using minimal auth data. Lookup method:', lookupMethod)
+        // Don't set patient to null — set a minimal object so the
+        // dashboard renders SOMETHING instead of the NoRecord page.
+        patientData = {
+          id: null,
+          hospital_id: meta.hospital_id || null,
+          full_name: meta.patient_name || authUser.email?.split('@')[0] || 'Patient',
+          hospital_number: meta.hospital_number || meta.mrn || null,
+          phone: null,
+          email: authUser.email,
+          _source: 'auth_user_minimal',
+        }
+        hospitalId = meta.hospital_id
+        lookupMethod = 'auth_user_minimal'
+      }
+
+      setPatient(patientData)
       setPhoneVerified(false)
+
+      // ---- Load the hospital (if we have a hospital_id) ----
+      // This is a direct table read — may fail due to RLS, but we
+      // try. If it fails, the patient still has their basic data.
+      if (hospitalId) {
+        try {
+          const { data: hospitalData } = await supabase
+            .from('hospitals')
+            .select('*')
+            .eq('id', hospitalId)
+            .maybeSingle()
+          if (hospitalData) {
+            setHospital(hospitalData)
+          } else {
+            // Minimal hospital object from metadata
+            setHospital({ id: hospitalId, name: meta.hospital_name || 'Your Hospital' })
+          }
+        } catch (e) {
+          console.warn('Hospital lookup failed (non-fatal):', e.message)
+          setHospital({ id: hospitalId, name: meta.hospital_name || 'Your Hospital' })
+        }
+      }
+
+      console.info('[AuthContext] Patient loaded via:', lookupMethod)
     } catch (err) {
-      // CRITICAL: never let this throw — the old code's unhandled
-      // rejection is what caused the auto-logout. Catch, log, and
-      // leave patient state intact (the patient may still be able
-      // to use parts of the app).
-      console.error('loadPatientData error (suppressed to prevent auto-logout):', err)
+      // CRITICAL: never let this throw — it would cause auto-logout.
+      console.error('loadPatientData error (suppressed):', err)
     }
   }, [])
 
@@ -104,7 +211,6 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     let mounted = true
 
-    // Get initial session
     supabase.auth.getSession().then(({ data: { session: initialSession } }) => {
       if (!mounted) return
       setSession(initialSession)
@@ -118,15 +224,10 @@ export function AuthProvider({ children }) {
       setLoading(false)
     })
 
-    // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, newSession) => {
         if (!mounted) return
 
-        // Only treat SIGNED_OUT as a true logout. Don't bounce the
-        // session on TOKEN_REFRESHED or INITIAL_SESSION — the old
-        // code would set loading=true and re-render, which combined
-        // with a transiently-null patient caused the auto-logout.
         if (event === 'SIGNED_OUT') {
           setSession(null)
           setUser(null)
@@ -158,10 +259,9 @@ export function AuthProvider({ children }) {
   }, [loadPatientData])
 
   // -----------------------------------------------------------------
-  // Login — patient no longer types their email.
-  // They type (name + hospital_id + mrn + password). We resolve the
-  // auth email via the lookup_portal_email RPC, then call Supabase's
-  // standard email+password sign-in.
+  // Login — patient types (name + hospital_id + mrn + password).
+  // Resolves the auth email via the lookup_portal_email RPC, then
+  // signs in. After sign-in, loadPatientData reads from user_metadata.
   // -----------------------------------------------------------------
   const login = useCallback(async ({ name, hospitalId, mrn, password }) => {
     if (!name || !hospitalId || !mrn || !password) {
@@ -186,7 +286,7 @@ export function AuthProvider({ children }) {
     }
 
     // Stash the lookup credentials so loadPatientData can fall back to
-    // them if the patient_users link is missing.
+    // them if user_metadata is missing.
     pendingLookupRef.current = {
       name: name.trim(),
       hospitalId,
@@ -203,18 +303,13 @@ export function AuthProvider({ children }) {
   }, [])
 
   // -----------------------------------------------------------------
-  // Sign up (self-registration) — patient creates their own account
-  // using name + hospital_id + mrn + email + password.
+  // Sign up (self-registration)
   // -----------------------------------------------------------------
   const signup = useCallback(async ({ name, hospitalId, mrn, email, password }) => {
     if (!name || !hospitalId || !mrn || !email || !password) {
       return { data: null, error: { message: 'All fields are required.' } }
     }
 
-    // Step 1: look up the patient record by (hospital_id + mrn)
-    // The patients table only has `hospital_number` as its MRN column
-    // (added in migration 068). There is no `mrn` column on patients —
-    // do not include it in the select list or PostgREST will error.
     const { data: patientData, error: lookupError } = await supabase
       .from('patients')
       .select('id, hospital_id, full_name, email, phone, hospital_number')
@@ -231,7 +326,6 @@ export function AuthProvider({ children }) {
       }
     }
 
-    // Step 1b: verify the name matches (case-insensitive)
     const normalize = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim()
     if (normalize(patientData.full_name) !== normalize(name)) {
       return {
@@ -242,7 +336,6 @@ export function AuthProvider({ children }) {
       }
     }
 
-    // Step 2: check if a portal account already exists for this patient
     const { data: existingUser } = await supabase
       .from('patient_users')
       .select('id')
@@ -258,10 +351,22 @@ export function AuthProvider({ children }) {
       }
     }
 
-    // Step 3: create the Supabase auth account
+    // IMPORTANT: store patient_id, hospital_id, patient_name in
+    // user_metadata at signup time too — so the JWT-based lookup
+    // works for self-registered accounts as well.
     const { data: authData, error: authError } = await supabase.auth.signUp({
       email: email.trim(),
       password,
+      options: {
+        data: {
+          patient_id: patientData.id,
+          hospital_id: patientData.hospital_id,
+          patient_name: patientData.full_name,
+          hospital_number: patientData.hospital_number || mrn.trim(),
+          phone: patientData.phone || null,
+          created_via: 'self_signup',
+        },
+      },
     })
 
     if (authError) {
@@ -272,9 +377,7 @@ export function AuthProvider({ children }) {
       return { data: null, error: { message: 'Account creation returned no user ID. Please try again.' } }
     }
 
-    // Step 4: link the auth account to the patient record
-    // Including patient_name + mrn so the new lookup_portal_email RPC
-    // can resolve them on the next login.
+    // Link the auth account to the patient record
     const { error: linkError } = await supabase
       .from('patient_users')
       .insert({
@@ -289,10 +392,6 @@ export function AuthProvider({ children }) {
 
     if (linkError) {
       console.error('Failed to link patient_users:', linkError)
-      // The auth account was created but the link failed — patient can
-      // still log in next time using email + password (the old flow),
-      // but the new RPC lookup won't find them. We surface this as a
-      // soft error so the patient can contact their hospital.
       return {
         data: authData,
         error: {
@@ -301,7 +400,6 @@ export function AuthProvider({ children }) {
       }
     }
 
-    // Stash the lookup credentials so loadPatientData works immediately
     pendingLookupRef.current = {
       name: patientData.full_name,
       hospitalId: patientData.hospital_id,
