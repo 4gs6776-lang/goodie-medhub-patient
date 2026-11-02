@@ -37,103 +37,58 @@ export function AuthProvider({ children }) {
     }
 
     try {
-      let patientData = null
-      let hospitalId = null
-
-      // ---- Step 1: primary lookup via patient_users.user_id ----
-      // After migration 070, user_id is uuid and auth.uid() is uuid,
-      // so this comparison works without a type error.
-      const { data: userRow, error: userErr } = await supabase
-        .from('patient_users')
-        .select('patient_id, hospital_id, is_active, patient_name, mrn')
-        .eq('user_id', authUser.id)
-        .eq('is_active', true)
-        .maybeSingle()
-
-      if (userErr) {
-        // If RLS still throws (shouldn't after the fix), fall through to
-        // Step 2 instead of crashing the auth flow.
-        console.warn('patient_users lookup returned an error (falling back to name+mrn):', userErr.message)
-      }
-
-      if (userRow?.patient_id) {
-        // ---- Found the link — load the patient record ----
-        const { data, error } = await supabase
-          .from('patients')
-          .select('*')
-          .eq('id', userRow.patient_id)
-          .maybeSingle()
-
-        if (!error && data) {
-          patientData = data
-          hospitalId = userRow.hospital_id || data.hospital_id
-        }
-      }
-
-      // ---- Step 2: fallback lookup by name + hospital_id + mrn ----
-      // Used when:
-      //   - patient_users link doesn't exist yet (staff forgot to create it)
-      //   - patient_users link was deactivated
-      //   - the primary lookup errored
-      if (!patientData && pendingLookupRef.current) {
-        const { name, hospitalId: hid, mrn } = pendingLookupRef.current
-        if (name && hid && mrn) {
-          // The patients table only has `hospital_number` as its MRN column
-          // (added in migration 068). There is no `mrn` column on patients —
-          // do not include `mrn.eq.` in the OR filter or PostgREST will error.
-          const { data: p, error: pErr } = await supabase
-            .from('patients')
-            .select('*')
-            .eq('hospital_id', hid)
-            .or(`hospital_number.eq.${mrn},patient_id.eq.${mrn}`)
-            .ilike('full_name', name)
-            .maybeSingle()
-
-          if (!pErr && p) {
-            patientData = p
-            hospitalId = p.hospital_id
-
-            // Auto-create the missing patient_users link so next time
-            // Step 1 succeeds.
-            try {
-              await supabase.from('patient_users').upsert({
-                user_id: authUser.id,
-                patient_id: p.id,
-                hospital_id: p.hospital_id,
-                patient_name: p.full_name,
-                mrn: p.hospital_number || p.id,
-                is_relative: false,
-                is_active: true,
-              }, { onConflict: 'user_id,patient_id' })
-            } catch (e) {
-              console.warn('Auto-link patient_users failed (non-fatal):', e.message)
-            }
+      // ---------------------------------------------------------------
+      // Call the get-my-patient-data Edge Function.
+      //
+      // WHY NOT direct table queries?
+      //   The patient portal was querying patient_users + patients
+      //   directly from the browser. Even though the patient_users row
+      //   existed (verified via SQL editor with the service role), the
+      //   browser kept getting 0 rows back. The cause was an RLS policy
+      //   that blocked the patient from reading their own row.
+      //
+      //   The Edge Function uses the SERVICE ROLE KEY (server-side only,
+      //   never exposed to the browser) to bypass RLS entirely. It:
+      //     1. Verifies the caller's JWT (patient must be logged in)
+      //     2. Reads patient_users WHERE user_id = auth.uid()
+      //     3. Falls back to (name + hospital_id + mrn) if no link
+      //     4. Reads the patient record + hospital record
+      //     5. Returns everything as one bundle
+      //
+      // We pass the optional (name, hospital_id, mrn) from
+      // pendingLookupRef so the function can use the name+mrn fallback
+      // if the patient_users link is missing.
+      // ---------------------------------------------------------------
+      const fallbackBody = pendingLookupRef.current
+        ? {
+            name: pendingLookupRef.current.name,
+            hospital_id: pendingLookupRef.current.hospitalId,
+            mrn: pendingLookupRef.current.mrn,
           }
-        }
-      }
+        : {}
 
-      if (!patientData) {
-        console.warn('No patient record found for auth user:', authUser.id)
+      const { data: bundle, error: fnError } = await supabase.functions.invoke(
+        'get-my-patient-data',
+        { body: fallbackBody }
+      )
+
+      if (fnError) {
+        console.error('get-my-patient-data Edge Function error:', fnError.message)
         setPatient(null)
         setHospital(null)
         return
       }
 
-      setPatient(patientData)
-      setPhoneVerified(false)
-
-      // ---- Load the hospital ----
-      if (hospitalId) {
-        const { data: hospitalData, error: hospitalErr } = await supabase
-          .from('hospitals')
-          .select('*')
-          .eq('id', hospitalId)
-          .maybeSingle()
-
-        if (!hospitalErr && hospitalData) {
-          setHospital(hospitalData)
-        }
+      if (!bundle || !bundle.patient) {
+        console.warn('No patient record found for auth user:', authUser.id, '(lookup_method:', bundle?.lookup_method || 'unknown', ')')
+        setPatient(null)
+        setHospital(null)
+        return
       }
+
+      setPatient(bundle.patient)
+      setHospital(bundle.hospital || null)
+      setPhoneVerified(false)
     } catch (err) {
       // CRITICAL: never let this throw — the old code's unhandled
       // rejection is what caused the auto-logout. Catch, log, and
