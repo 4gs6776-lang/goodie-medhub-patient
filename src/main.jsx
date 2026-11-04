@@ -15,6 +15,7 @@ import Appointments from './pages/Appointments'
 import Documents from './pages/Documents'
 import Prescriptions from './pages/Prescriptions'
 import Notifications from './pages/Notifications'
+import PatientVirtualConsultation from './components/PatientVirtualConsultation'
 import './index.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
@@ -34,6 +35,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(
             <Route path="/prescriptions" element={<Prescriptions />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/profile" element={<Profile />} />
+            <Route path="/video-call/:roomId" element={
+              <ProtectedRoute>
+                <PatientVirtualConsultationWrapper />
+              </ProtectedRoute>
+            } />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
@@ -41,3 +47,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     </BrowserRouter>
   </React.StrictMode>
 )
+
+// Wrapper component to extract roomId from URL params
+function PatientVirtualConsultationWrapper() {
+  const params = new URLSearchParams(window.location.search)
+  const roomId = window.location.pathname.split('/video-call/')[1] || ''
+  return <PatientVirtualConsultation roomId={roomId} onClose={() => window.location.href = '/appointments'} />
+}
