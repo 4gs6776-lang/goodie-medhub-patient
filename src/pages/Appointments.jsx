@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { supabase } from '../lib/supabaseClient'
 import { fetchAppointments } from '../lib/patientDataService'
 import { fetchAppointmentRequests, createAppointmentRequest, cancelAppointmentRequest } from '../lib/patientRequestService'
-import { Calendar, Clock, CheckCircle2, XCircle, Plus, ArrowLeft, Send, RefreshCw, X } from 'lucide-react'
+import { Calendar, Clock, CheckCircle2, XCircle, Plus, ArrowLeft, Send, RefreshCw, X, Video } from 'lucide-react'
 
 function formatDate(d) { return d ? new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—' }
 function formatTime(d) { return d ? new Date(d).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '' }
@@ -23,8 +25,10 @@ function statusBadge(status) {
 
 export default function Appointments() {
   const { patient, hospital } = useAuth()
+  const navigate = useNavigate()
   const [appointments, setAppointments] = useState([])
   const [requests, setRequests] = useState([])
+  const [virtualConsults, setVirtualConsults] = useState([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [showForm, setShowForm] = useState(false)
@@ -42,6 +46,16 @@ export default function Appointments() {
       ])
       setAppointments(apptRes.data || [])
       setRequests(reqRes.data || [])
+
+      // Fetch virtual consultations for this patient
+      const { data: vcData } = await supabase
+        .from('virtual_consultations')
+        .select('*')
+        .eq('hospital_id', patient.hospital_id)
+        .eq('patient_id', patient.id)
+        .in('status', ['scheduled', 'waiting', 'in_progress'])
+        .order('scheduled_start', { ascending: true })
+      setVirtualConsults(vcData || [])
     } catch (err) { setError(err.message) }
     finally { setLoading(false); setRefreshing(false) }
   }, [patient?.id, patient?.hospital_id])
@@ -148,6 +162,41 @@ export default function Appointments() {
                 </div>
               )
             })}
+          </div>
+        </div>
+      )}
+
+      {/* Virtual Consultations */}
+      {virtualConsults.length > 0 && (
+        <div>
+          <h2 className="text-sm font-bold text-surface-600 mb-2 flex items-center gap-1.5">
+            <Video size={14} className="text-primary-500" /> Virtual Consultations
+          </h2>
+          <div className="space-y-2">
+            {virtualConsults.map(vc => (
+              <div key={vc.id} className="bg-white rounded-2xl p-4 card-shadow border border-primary-100">
+                <div className="flex items-center justify-between">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-bold text-surface-900">
+                      {formatDate(vc.scheduled_start)}
+                    </div>
+                    <div className="text-xs text-surface-400 mt-0.5">
+                      {formatTime(vc.scheduled_start) || 'Any time'}
+                      {vc.doctor_name ? ` · Dr. ${vc.doctor_name}` : ''}
+                    </div>
+                    <div className="text-xs text-primary-600 mt-1 font-medium">
+                      Status: {vc.status === 'in_progress' ? 'In progress — join now!' : vc.status === 'waiting' ? 'Doctor is waiting — join now!' : 'Scheduled'}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => navigate(`/video-call/${vc.room_id}`)}
+                    className="px-3 py-2 rounded-xl bg-primary-500 text-white text-xs font-bold flex items-center gap-1.5"
+                  >
+                    <Video size={14} /> Join
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
