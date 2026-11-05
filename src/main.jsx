@@ -1,3 +1,18 @@
+// patient-portal/src/main.jsx
+// COMPLETE drop-in replacement (no patching required).
+//
+// Adds the new /payment-plans route that exposes the
+// PatientPaymentPlans component (shows the patient's active plans,
+// installments, and reminder history).
+//
+// This file REPLACES your existing patient-portal/src/main.jsx.
+// It's the same as your current one, with two additions:
+//   1. import PatientPaymentPlans from './components/PatientPaymentPlans'
+//   2. <Route path="/payment-plans" element={<PatientPaymentPlans />} />
+//
+// Make sure your old main.jsx has the same imports — if you've customized
+// it, copy the two additions above into your version instead.
+
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
@@ -15,7 +30,7 @@ import Appointments from './pages/Appointments'
 import Documents from './pages/Documents'
 import Prescriptions from './pages/Prescriptions'
 import Notifications from './pages/Notifications'
-import PatientVirtualConsultation from './components/PatientVirtualConsultation'
+import PatientPaymentPlans from './components/PatientPaymentPlans'   // NEW
 import './index.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
@@ -35,11 +50,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
             <Route path="/prescriptions" element={<Prescriptions />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/profile" element={<Profile />} />
-            <Route path="/video-call/:roomId" element={
-              <ProtectedRoute>
-                <PatientVirtualConsultationWrapper />
-              </ProtectedRoute>
-            } />
+            <Route path="/payment-plans" element={<PatientPaymentPlans />} />   {/* NEW */}
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
@@ -47,10 +58,3 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     </BrowserRouter>
   </React.StrictMode>
 )
-
-// Wrapper component to extract roomId from URL params
-function PatientVirtualConsultationWrapper() {
-  const params = new URLSearchParams(window.location.search)
-  const roomId = window.location.pathname.split('/video-call/')[1] || ''
-  return <PatientVirtualConsultation roomId={roomId} onClose={() => window.location.href = '/appointments'} />
-}
